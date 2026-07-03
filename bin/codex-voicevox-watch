@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+DEFAULT_ENGINE = "http://127.0.0.1:50021"
+DEFAULT_SPEAKER = "3"
+DEFAULT_MAX_CHARS = 180
+POLL_SECONDS = 1.0
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+SESSIONS_ROOT = CODEX_HOME / "sessions"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "codex-voicevox-watch"
+PID_FILE = STATE_DIR / "watch.pid"
+STATE_FILE = STATE_DIR / "state.json"
+LOG_FILE = STATE_DIR / "watch.log"
+
+
+POWERSHELL_SAY_BODY = r"""
+$ErrorActionPreference = "Stop"
+$bytes = [Convert]::FromBase64String($TextB64)
+$text = [Text.Encoding]::UTF8.GetString($bytes)
+$encoded = [System.Uri]::EscapeDataString($text)
+$query = Invoke-RestMethod -Method Post -Uri "$Engine/audio_query?text=$encoded&speaker=$Speaker"
+$queryJson = $query | ConvertTo-Json -Depth 100
+$wav = Join-Path $env:TEMP ("codex_voicevox_watch_{0}.wav" -f ([Guid]::NewGuid().ToString("N")))
+Invoke-WebRequest -Method Post -Uri "$Engine/synthesis?speaker=$Speaker" -ContentType "application/json" -Body $queryJson -OutFile $wav | Out-Null
+(New-Object Media.SoundPlayer $wav).PlaySync()
+Remove-Item -LiteralPath $wav -ErrorAction SilentlyContinue
+"""
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log(message):
+    ensure_state_dir()
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"{now_iso()} {message}\n")
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {"offsets": {}, "last_spoken_at": None, "last_text": None, "last_error": None}
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"offsets": {}, "last_spoken_at": None, "last_text": None, "last_error": "state file was unreadable"}
+    state.setdefault("offsets", {})
+    state.setdefault("last_spoken_at", None)
+    state.setdefault("last_text", None)
+    state.setdefault("last_error", None)
+    return state
+
+
+def save_state(state):
+    ensure_state_dir()
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+    tmp.replace(STATE_FILE)
+
+
+def session_files():
+    if not SESSIONS_ROOT.exists():
+        return []
+    return sorted(SESSIONS_ROOT.glob("*/*/*/*.jsonl"))
+
+
+def baseline_state():
+    state = load_state()
+    offsets = {}
+    for path in session_files():
+        try:
+            offsets[str(path)] = path.stat().st_size
+        except OSError:
+            continue
+    state["offsets"] = offsets
+    state["last_error"] = None
+    save_state(state)
+
+
+def process_new_content(path, offset):
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return offset, []
+    if size < offset:
+        offset = 0
+    if size == offset:
+        return offset, []
+
+    texts = []
+    try:
+        with path.open("rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return offset, []
+
+    for raw_line in data.splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            item = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        text = extract_speakable_text(item)
+        if text:
+            texts.append(text)
+    return size, texts
+
+
+def extract_speakable_text(item):
+    if item.get("type") != "response_item":
+        return None
+    payload = item.get("payload") or {}
+    if payload.get("type") != "message":
+        return None
+    if payload.get("role") != "assistant":
+        return None
+
+    parts = []
+    for content in payload.get("content") or []:
+        if isinstance(content, dict) and content.get("type") == "output_text":
+            text = content.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    if not parts:
+        return None
+    return clean_for_speech("\n".join(parts))
+
+
+def clean_for_speech(text):
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"<proposed_plan>.*?</proposed_plan>", "実装計画を提示しました。", text, flags=re.S)
+    text = re.sub(r"https?://\S+", "URL", text)
+
+    cleaned_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if looks_like_noise(stripped):
+            continue
+        cleaned_lines.append(stripped)
+
+    text = "。".join(cleaned_lines)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"([。！？])。+", r"\1", text)
+    text = text.strip(" 。")
+    if not text:
+        return None
+
+    max_chars = int(os.environ.get("CODEX_VOICEVOX_MAX_CHARS", DEFAULT_MAX_CHARS))
+    if len(text) > max_chars:
+        text = trim_to_sentence(text, max_chars)
+    return text
+
+
+def looks_like_noise(line):
+    if line.startswith(("diff --git", "+++", "---", "@@")):
+        return True
+    if re.match(r"^[+\-]\s", line):
+        return True
+    if re.match(r"^\|.*\|$", line):
+        return True
+    if re.match(r"^[\w./~:-]+\s+\d+(\.\d+)?[KMG]?B$", line):
+        return True
+    if len(line) > 240 and not re.search(r"[。！？.!?]", line):
+        return True
+    return False
+
+
+def trim_to_sentence(text, max_chars):
+    cut = text[:max_chars]
+    last = max(cut.rfind("。"), cut.rfind("！"), cut.rfind("？"), cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if last >= 40:
+        return cut[: last + 1] + " 以下省略します。"
+    return cut.rstrip() + "。以下省略します。"
+
+
+def voicevox_say(text, dry_run=False):
+    if dry_run:
+        print(text)
+        return
+    engine = os.environ.get("VOICEVOX_ENGINE", DEFAULT_ENGINE)
+    speaker = os.environ.get("VOICEVOX_SPEAKER", DEFAULT_SPEAKER)
+    text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    script = "\n".join(
+        [
+            f"$TextB64 = '{ps_single_quote(text_b64)}'",
+            f"$Engine = '{ps_single_quote(engine)}'",
+            f"$Speaker = '{ps_single_quote(speaker)}'",
+            POWERSHELL_SAY_BODY,
+        ]
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(stderr or f"powershell exited with {result.returncode}")
+
+
+def ps_single_quote(value):
+    return str(value).replace("'", "''")
+
+
+def run_watcher(dry_run=False):
+    ensure_state_dir()
+    state = load_state()
+    offsets = state.setdefault("offsets", {})
+    log("watcher started")
+
+    while True:
+        changed = False
+        for path in session_files():
+            key = str(path)
+            offset = int(offsets.get(key, 0))
+            new_offset, texts = process_new_content(path, offset)
+            if new_offset != offset:
+                offsets[key] = new_offset
+                changed = True
+            for text in texts:
+                try:
+                    voicevox_say(text, dry_run=dry_run)
+                    state["last_spoken_at"] = now_iso()
+                    state["last_text"] = text
+                    state["last_error"] = None
+                    changed = True
+                except Exception as exc:
+                    state["last_error"] = str(exc)
+                    log(f"say failed: {exc}")
+                    changed = True
+        if changed:
+            save_state(state)
+        time.sleep(POLL_SECONDS)
+
+
+def is_pid_running(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def read_pid():
+    try:
+        return int(PID_FILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def start(args):
+    ensure_state_dir()
+    pid = read_pid()
+    if pid and is_pid_running(pid):
+        print(f"already running: pid={pid}")
+        return 0
+
+    baseline_state()
+    log_handle = LOG_FILE.open("a", encoding="utf-8")
+    cmd = [sys.executable, str(Path(__file__).resolve()), "run"]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=log_handle,
+        start_new_session=True,
+        close_fds=True,
+    )
+    PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+    print(f"started: pid={proc.pid}")
+    return 0
+
+
+def stop(_args):
+    pid = read_pid()
+    if not pid or not is_pid_running(pid):
+        print("not running")
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        if not is_pid_running(pid):
+            break
+        time.sleep(0.1)
+    if is_pid_running(pid):
+        print(f"still running: pid={pid}")
+        return 1
+    try:
+        PID_FILE.unlink()
+    except OSError:
+        pass
+    print("stopped")
+    return 0
+
+
+def status(_args):
+    pid = read_pid()
+    running = bool(pid and is_pid_running(pid))
+    state = load_state()
+    print(f"running={str(running).lower()}")
+    if pid:
+        print(f"pid={pid}")
+    print(f"state={STATE_FILE}")
+    print(f"log={LOG_FILE}")
+    print(f"last_spoken_at={state.get('last_spoken_at')}")
+    print(f"last_error={state.get('last_error')}")
+    try:
+        engine = os.environ.get("VOICEVOX_ENGINE", DEFAULT_ENGINE)
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", f"Invoke-RestMethod -Uri '{engine}/version'"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+        print("voicevox=ok")
+    except Exception as exc:
+        print(f"voicevox=error: {exc}")
+    return 0
+
+
+def self_test(_args):
+    samples = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "検証が完了しました。\n```bash\necho skip\n```\n次の操作を待っています。"}],
+            },
+        },
+        {"type": "response_item", "payload": {"type": "function_call_output", "output": "読まない"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "<proposed_plan>\n長い計画\n</proposed_plan>"}],
+            },
+        },
+    ]
+    texts = [extract_speakable_text(item) for item in samples]
+    texts = [text for text in texts if text]
+    expected = ["検証が完了しました。次の操作を待っています", "実装計画を提示しました"]
+    if texts != expected:
+        print("self-test failed")
+        print(json.dumps(texts, ensure_ascii=False, indent=2))
+        return 1
+    print("self-test ok")
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Read new Codex assistant messages aloud with VOICEVOX.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_start = sub.add_parser("start", help="start the background watcher")
+    p_start.add_argument("--dry-run", action="store_true", help="log speakable text instead of playing audio")
+    p_start.set_defaults(func=start)
+
+    sub.add_parser("stop", help="stop the background watcher").set_defaults(func=stop)
+    sub.add_parser("status", help="show watcher status").set_defaults(func=status)
+
+    p_run = sub.add_parser("run", help=argparse.SUPPRESS)
+    p_run.add_argument("--dry-run", action="store_true")
+    p_run.set_defaults(func=lambda args: run_watcher(dry_run=args.dry_run))
+
+    p_say = sub.add_parser("say", help="play one text with VOICEVOX")
+    p_say.add_argument("text")
+    p_say.add_argument("--dry-run", action="store_true")
+    p_say.set_defaults(func=lambda args: (voicevox_say(args.text, dry_run=args.dry_run) or 0))
+
+    sub.add_parser("self-test", help="run parser/filter self-test").set_defaults(func=self_test)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        log(f"fatal: {exc}")
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
