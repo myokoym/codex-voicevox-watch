@@ -19,10 +19,40 @@ POLL_SECONDS = 1.0
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
 SESSIONS_ROOT = CODEX_HOME / "sessions"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "codex-voicevox-watch"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "codex-voicevox-watch"
 PID_FILE = STATE_DIR / "watch.pid"
 STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = STATE_DIR / "watch.log"
+
+DEFAULT_CONFIG = {
+    "engine": DEFAULT_ENGINE,
+    "speaker": DEFAULT_SPEAKER,
+    "max_chars": DEFAULT_MAX_CHARS,
+    "speed_scale": 1.0,
+    "pitch_scale": 0.0,
+    "intonation_scale": 1.0,
+    "volume_scale": 1.0,
+    "pre_phoneme_length": 0.1,
+    "post_phoneme_length": 0.1,
+    "pause_length_scale": 1.0,
+    "poll_seconds": POLL_SECONDS,
+}
+
+CONFIG_TYPES = {
+    "engine": str,
+    "speaker": str,
+    "max_chars": int,
+    "speed_scale": float,
+    "pitch_scale": float,
+    "intonation_scale": float,
+    "volume_scale": float,
+    "pre_phoneme_length": float,
+    "post_phoneme_length": float,
+    "pause_length_scale": float,
+    "poll_seconds": float,
+}
 
 
 POWERSHELL_SAY_BODY = r"""
@@ -31,6 +61,13 @@ $bytes = [Convert]::FromBase64String($TextB64)
 $text = [Text.Encoding]::UTF8.GetString($bytes)
 $encoded = [System.Uri]::EscapeDataString($text)
 $query = Invoke-RestMethod -Method Post -Uri "$Engine/audio_query?text=$encoded&speaker=$Speaker"
+$query.speedScale = [double]$SpeedScale
+$query.pitchScale = [double]$PitchScale
+$query.intonationScale = [double]$IntonationScale
+$query.volumeScale = [double]$VolumeScale
+$query.prePhonemeLength = [double]$PrePhonemeLength
+$query.postPhonemeLength = [double]$PostPhonemeLength
+$query.pauseLengthScale = [double]$PauseLengthScale
 $queryJson = $query | ConvertTo-Json -Depth 100
 $wav = Join-Path $env:TEMP ("codex_voicevox_watch_{0}.wav" -f ([Guid]::NewGuid().ToString("N")))
 Invoke-WebRequest -Method Post -Uri "$Engine/synthesis?speaker=$Speaker" -ContentType "application/json" -Body $queryJson -OutFile $wav | Out-Null
@@ -45,6 +82,79 @@ def now_iso():
 
 def ensure_state_dir():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_config_dir():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            with CONFIG_FILE.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                for key, value in loaded.items():
+                    if key in CONFIG_TYPES:
+                        config[key] = coerce_config_value(key, value)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"config file is invalid: {CONFIG_FILE}: {exc}") from exc
+
+    env_overrides = {
+        "VOICEVOX_ENGINE": "engine",
+        "VOICEVOX_SPEAKER": "speaker",
+        "CODEX_VOICEVOX_MAX_CHARS": "max_chars",
+        "CODEX_VOICEVOX_SPEED_SCALE": "speed_scale",
+        "CODEX_VOICEVOX_PITCH_SCALE": "pitch_scale",
+        "CODEX_VOICEVOX_INTONATION_SCALE": "intonation_scale",
+        "CODEX_VOICEVOX_VOLUME_SCALE": "volume_scale",
+    }
+    for env_name, key in env_overrides.items():
+        if env_name in os.environ:
+            config[key] = coerce_config_value(key, os.environ[env_name])
+    validate_config(config)
+    return config
+
+
+def save_config(config):
+    ensure_config_dir()
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp.replace(CONFIG_FILE)
+
+
+def coerce_config_value(key, value):
+    expected = CONFIG_TYPES[key]
+    if expected is str:
+        return str(value)
+    if expected is int:
+        return int(value)
+    if expected is float:
+        return float(value)
+    raise KeyError(key)
+
+
+def validate_config(config):
+    if not str(config["engine"]).startswith(("http://", "https://")):
+        raise ValueError("engine must start with http:// or https://")
+    if int(config["max_chars"]) < 20:
+        raise ValueError("max_chars must be at least 20")
+    if float(config["poll_seconds"]) <= 0:
+        raise ValueError("poll_seconds must be greater than 0")
+    positive_keys = [
+        "speed_scale",
+        "intonation_scale",
+        "volume_scale",
+        "pre_phoneme_length",
+        "post_phoneme_length",
+        "pause_length_scale",
+    ]
+    for key in positive_keys:
+        if float(config[key]) <= 0:
+            raise ValueError(f"{key} must be greater than 0")
 
 
 def log(message):
@@ -146,7 +256,7 @@ def extract_speakable_text(item):
     return clean_for_speech("\n".join(parts))
 
 
-def clean_for_speech(text):
+def clean_for_speech(text, config=None):
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"<proposed_plan>.*?</proposed_plan>", "実装計画を提示しました。", text, flags=re.S)
@@ -168,7 +278,9 @@ def clean_for_speech(text):
     if not text:
         return None
 
-    max_chars = int(os.environ.get("CODEX_VOICEVOX_MAX_CHARS", DEFAULT_MAX_CHARS))
+    if config is None:
+        config = load_config()
+    max_chars = int(config["max_chars"])
     if len(text) > max_chars:
         text = trim_to_sentence(text, max_chars)
     return text
@@ -200,14 +312,22 @@ def voicevox_say(text, dry_run=False):
     if dry_run:
         print(text)
         return
-    engine = os.environ.get("VOICEVOX_ENGINE", DEFAULT_ENGINE)
-    speaker = os.environ.get("VOICEVOX_SPEAKER", DEFAULT_SPEAKER)
+    config = load_config()
+    engine = str(config["engine"])
+    speaker = str(config["speaker"])
     text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
     script = "\n".join(
         [
             f"$TextB64 = '{ps_single_quote(text_b64)}'",
             f"$Engine = '{ps_single_quote(engine)}'",
             f"$Speaker = '{ps_single_quote(speaker)}'",
+            f"$SpeedScale = '{ps_single_quote(config['speed_scale'])}'",
+            f"$PitchScale = '{ps_single_quote(config['pitch_scale'])}'",
+            f"$IntonationScale = '{ps_single_quote(config['intonation_scale'])}'",
+            f"$VolumeScale = '{ps_single_quote(config['volume_scale'])}'",
+            f"$PrePhonemeLength = '{ps_single_quote(config['pre_phoneme_length'])}'",
+            f"$PostPhonemeLength = '{ps_single_quote(config['post_phoneme_length'])}'",
+            f"$PauseLengthScale = '{ps_single_quote(config['pause_length_scale'])}'",
             POWERSHELL_SAY_BODY,
         ]
     )
@@ -232,6 +352,7 @@ def run_watcher(dry_run=False):
     log("watcher started")
 
     while True:
+        config = load_config()
         changed = False
         for path in session_files():
             key = str(path)
@@ -253,7 +374,7 @@ def run_watcher(dry_run=False):
                     changed = True
         if changed:
             save_state(state)
-        time.sleep(POLL_SECONDS)
+        time.sleep(float(config["poll_seconds"]))
 
 
 def is_pid_running(pid):
@@ -329,17 +450,30 @@ def status(_args):
     pid = read_pid()
     running = bool(pid and is_pid_running(pid))
     state = load_state()
+    config = load_config()
     print(f"running={str(running).lower()}")
     if pid:
         print(f"pid={pid}")
+    print(f"config={CONFIG_FILE}")
     print(f"state={STATE_FILE}")
     print(f"log={LOG_FILE}")
+    print(f"sessions={SESSIONS_ROOT}")
+    print(f"engine={config['engine']}")
+    print(f"speaker={config['speaker']}")
+    print(f"max_chars={config['max_chars']}")
+    print(f"speed_scale={config['speed_scale']}")
+    print(f"pitch_scale={config['pitch_scale']}")
+    print(f"intonation_scale={config['intonation_scale']}")
+    print(f"volume_scale={config['volume_scale']}")
+    print(f"pre_phoneme_length={config['pre_phoneme_length']}")
+    print(f"post_phoneme_length={config['post_phoneme_length']}")
+    print(f"pause_length_scale={config['pause_length_scale']}")
+    print(f"poll_seconds={config['poll_seconds']}")
     print(f"last_spoken_at={state.get('last_spoken_at')}")
     print(f"last_error={state.get('last_error')}")
     try:
-        engine = os.environ.get("VOICEVOX_ENGINE", DEFAULT_ENGINE)
         subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", f"Invoke-RestMethod -Uri '{engine}/version'"],
+            ["powershell.exe", "-NoProfile", "-Command", f"Invoke-RestMethod -Uri '{ps_single_quote(config['engine'])}/version'"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -383,6 +517,29 @@ def self_test(_args):
     return 0
 
 
+def config_show(_args):
+    print(json.dumps(load_config(), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def config_path(_args):
+    print(CONFIG_FILE)
+    return 0
+
+
+def config_set(args):
+    key = args.key
+    if key not in CONFIG_TYPES:
+        valid = ", ".join(sorted(CONFIG_TYPES))
+        raise ValueError(f"unknown config key: {key}; valid keys: {valid}")
+    config = load_config()
+    config[key] = coerce_config_value(key, args.value)
+    validate_config(config)
+    save_config(config)
+    print(f"{key}={config[key]}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Read new Codex assistant messages aloud with VOICEVOX.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -402,6 +559,15 @@ def build_parser():
     p_say.add_argument("text")
     p_say.add_argument("--dry-run", action="store_true")
     p_say.set_defaults(func=lambda args: (voicevox_say(args.text, dry_run=args.dry_run) or 0))
+
+    p_config = sub.add_parser("config", help="show or update persistent settings")
+    config_sub = p_config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("show", help="show effective settings").set_defaults(func=config_show)
+    config_sub.add_parser("path", help="show config file path").set_defaults(func=config_path)
+    p_config_set = config_sub.add_parser("set", help="set one config value")
+    p_config_set.add_argument("key")
+    p_config_set.add_argument("value")
+    p_config_set.set_defaults(func=config_set)
 
     sub.add_parser("self-test", help="run parser/filter self-test").set_defaults(func=self_test)
     return parser
